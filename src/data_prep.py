@@ -19,6 +19,7 @@ CATEGORY = "FOODS"      # keep only food items
 N_ITEMS = 40            # how many items to keep
 WINDOW_DAYS = 730       # use only the most recent N days (about 2 years)
 CANDIDATE_BUFFER = 20   # extra top sellers examined, in case some have gaps
+MIN_ZERO_RUN = 14       # a run of this many zero-sales days in a row = "unavailable"
 
 ID_COLS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
@@ -105,6 +106,25 @@ def add_prices(df, raw_dir, items):
     return df, int(n_missing)
 
 
+def mark_unavailable(df, min_len):
+    """Flag days that sit inside a run of >= min_len consecutive zero-sales days.
+
+    Long zero runs on items that normally sell are almost always stock-outs or
+    periods when the item was not stocked, so they are NOT real zero demand.
+    The rows are kept (so the calendar stays complete) but flagged, and the
+    forecaster should exclude them from training.
+    """
+    def run_length(s):
+        is_zero = (s == 0)
+        run_id = (is_zero != is_zero.shift()).cumsum()
+        return is_zero.groupby(run_id).transform("sum")
+
+    df = df.sort_values(["store_id", "item_id", "date"]).reset_index(drop=True)
+    run = df.groupby(["store_id", "item_id"])["units"].transform(run_length)
+    df["unavailable"] = ((df["units"] == 0) & (run >= min_len)).astype(int)
+    return df
+
+
 def keep_complete_items(df, candidates, n_items, n_stores, window_days):
     """Keep only items on sale in EVERY store for EVERY day of the window.
 
@@ -123,7 +143,8 @@ def keep_complete_items(df, candidates, n_items, n_stores, window_days):
     return df[df["item_id"].isin(kept)].copy(), kept, rejected
 
 
-def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT_PATH):
+def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT_PATH,
+         min_zero_run=MIN_ZERO_RUN):
     raw_dir, out_path = Path(raw_dir), Path(out_path)
 
     print("Loading sales ...")
@@ -142,7 +163,9 @@ def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT
     print(f"  kept {len(items)} items with a full price history in all {n_stores} stores")
     print(f"  top sellers rejected for gaps in price history: {rejected if rejected else 'none'}")
 
-    df = df.sort_values(["store_id", "item_id", "date"]).reset_index(drop=True)
+    df = mark_unavailable(df, min_zero_run)
+    print(f"  days flagged 'unavailable' (zero-sales runs of {min_zero_run}+ days): "
+          f"{100 * df['unavailable'].mean():.1f}%")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
@@ -161,5 +184,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--items", type=int, default=N_ITEMS)
     parser.add_argument("--window", type=int, default=WINDOW_DAYS)
+    parser.add_argument("--zero-run", type=int, default=MIN_ZERO_RUN)
     args = parser.parse_args()
-    main(n_items=args.items, window_days=args.window)
+    main(n_items=args.items, window_days=args.window, min_zero_run=args.zero_run)
