@@ -18,6 +18,7 @@ OUT_PATH = Path("data/processed/m5_subset.csv")
 CATEGORY = "FOODS"      # keep only food items
 N_ITEMS = 40            # how many items to keep
 WINDOW_DAYS = 730       # use only the most recent N days (about 2 years)
+CANDIDATE_BUFFER = 20   # extra top sellers examined, in case some have gaps
 
 ID_COLS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
@@ -104,20 +105,42 @@ def add_prices(df, raw_dir, items):
     return df, int(n_missing)
 
 
+def keep_complete_items(df, candidates, n_items, n_stores, window_days):
+    """Keep only items on sale in EVERY store for EVERY day of the window.
+
+    candidates is in ranking order (best seller first), so the first n_items
+    complete ones are the top sellers that satisfy the rule.
+    """
+    rows_per_item = df.groupby("item_id").size()
+    complete = set(rows_per_item[rows_per_item == n_stores * window_days].index)
+    kept = [i for i in candidates if i in complete][:n_items]
+    rejected = [i for i in candidates if i not in complete and i in set(rows_per_item.index)]
+    if len(kept) < n_items:
+        raise ValueError(
+            f"Only {len(kept)} items have complete price history; "
+            f"raise CANDIDATE_BUFFER or lower --items."
+        )
+    return df[df["item_id"].isin(kept)].copy(), kept, rejected
+
+
 def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT_PATH):
     raw_dir, out_path = Path(raw_dir), Path(out_path)
 
     print("Loading sales ...")
     sales, day_cols = load_sales_wide(find_sales_file(raw_dir))
+    n_stores = sales["store_id"].nunique()
     print(f"  raw sales table: {sales.shape[0]} series x {len(day_cols)} days")
 
-    items = select_items(sales, day_cols, CATEGORY, n_items, window_days)
-    print(f"  selected {len(items)} {CATEGORY} items (top sellers, last {window_days} days)")
+    candidates = select_items(sales, day_cols, CATEGORY, n_items + CANDIDATE_BUFFER, window_days)
+    print(f"  ranked {len(candidates)} candidate {CATEGORY} items (top sellers, last {window_days} days)")
 
-    df = to_long(sales, day_cols, items, window_days)
+    df = to_long(sales, day_cols, candidates, window_days)
     df = add_calendar(df, raw_dir)
-    df, n_missing = add_prices(df, raw_dir, items)
-    print(f"  rows dropped because item had no price that week: {n_missing}")
+    df, n_missing = add_prices(df, raw_dir, candidates)
+
+    df, items, rejected = keep_complete_items(df, candidates, n_items, n_stores, window_days)
+    print(f"  kept {len(items)} items with a full price history in all {n_stores} stores")
+    print(f"  top sellers rejected for gaps in price history: {rejected if rejected else 'none'}")
 
     df = df.sort_values(["store_id", "item_id", "date"]).reset_index(drop=True)
 
