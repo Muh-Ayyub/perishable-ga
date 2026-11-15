@@ -18,8 +18,9 @@ OUT_PATH = Path("data/processed/m5_subset.csv")
 CATEGORY = "FOODS"      # keep only food items
 N_ITEMS = 40            # how many items to keep
 WINDOW_DAYS = 730       # use only the most recent N days (about 2 years)
-CANDIDATE_BUFFER = 20   # extra top sellers examined, in case some have gaps
+CANDIDATE_BUFFER = 30   # extra top sellers examined, in case some fail the rules
 MIN_ZERO_RUN = 14       # a run of this many zero-sales days in a row = "unavailable"
+MAX_UNAVAILABLE_SHARE = 0.25  # drop items unavailable on more than 25% of days
 
 ID_COLS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
@@ -125,26 +126,38 @@ def mark_unavailable(df, min_len):
     return df
 
 
-def keep_complete_items(df, candidates, n_items, n_stores, window_days):
+def keep_complete_items(df, candidates, n_stores, window_days):
     """Keep only items on sale in EVERY store for EVERY day of the window.
 
-    candidates is in ranking order (best seller first), so the first n_items
-    complete ones are the top sellers that satisfy the rule.
+    Returns the filtered table, the complete items (in ranking order) and the
+    rejected ones.
     """
     rows_per_item = df.groupby("item_id").size()
-    complete = set(rows_per_item[rows_per_item == n_stores * window_days].index)
-    kept = [i for i in candidates if i in complete][:n_items]
-    rejected = [i for i in candidates if i not in complete and i in set(rows_per_item.index)]
+    complete_set = set(rows_per_item[rows_per_item == n_stores * window_days].index)
+    complete = [i for i in candidates if i in complete_set]
+    rejected = [i for i in candidates if i not in complete_set]
+    return df[df["item_id"].isin(complete_set)].copy(), complete, rejected
+
+
+def drop_mostly_unavailable(df, ranked_items, n_items, max_share):
+    """Drop items that were 'unavailable' on more than max_share of days.
+
+    ranked_items is in ranking order (best seller first), so after dropping,
+    the first n_items survivors are the top sellers that satisfy every rule.
+    """
+    share = df.groupby("item_id")["unavailable"].mean()
+    kept = [i for i in ranked_items if share[i] <= max_share][:n_items]
+    rejected = [i for i in ranked_items if share[i] > max_share]
     if len(kept) < n_items:
         raise ValueError(
-            f"Only {len(kept)} items have complete price history; "
+            f"Only {len(kept)} items pass all rules; "
             f"raise CANDIDATE_BUFFER or lower --items."
         )
-    return df[df["item_id"].isin(kept)].copy(), kept, rejected
+    return df[df["item_id"].isin(kept)].copy(), kept, rejected, share
 
 
 def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT_PATH,
-         min_zero_run=MIN_ZERO_RUN):
+         min_zero_run=MIN_ZERO_RUN, max_unavailable_share=MAX_UNAVAILABLE_SHARE):
     raw_dir, out_path = Path(raw_dir), Path(out_path)
 
     print("Loading sales ...")
@@ -159,13 +172,21 @@ def main(n_items=N_ITEMS, window_days=WINDOW_DAYS, raw_dir=RAW_DIR, out_path=OUT
     df = add_calendar(df, raw_dir)
     df, n_missing = add_prices(df, raw_dir, candidates)
 
-    df, items, rejected = keep_complete_items(df, candidates, n_items, n_stores, window_days)
-    print(f"  kept {len(items)} items with a full price history in all {n_stores} stores")
-    print(f"  top sellers rejected for gaps in price history: {rejected if rejected else 'none'}")
+    # Rule 1: full price history in every store
+    df, complete, rej_price = keep_complete_items(df, candidates, n_stores, window_days)
+    print(f"  rejected for gaps in price history: {rej_price if rej_price else 'none'}")
 
+    # Flag long zero-sales runs, then Rule 2: not mostly unavailable
     df = mark_unavailable(df, min_zero_run)
+    df, items, rej_unavail, share = drop_mostly_unavailable(
+        df, complete, n_items, max_unavailable_share)
+    print(f"  rejected for being unavailable on >{100 * max_unavailable_share:.0f}% of days: "
+          f"{rej_unavail if rej_unavail else 'none'}")
+    print(f"  kept {len(items)} items")
     print(f"  days flagged 'unavailable' (zero-sales runs of {min_zero_run}+ days): "
           f"{100 * df['unavailable'].mean():.1f}%")
+    worst = df.groupby(["store_id", "item_id"])["unavailable"].mean().max()
+    print(f"  worst single series: {100 * worst:.0f}% of days unavailable")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
@@ -185,5 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--items", type=int, default=N_ITEMS)
     parser.add_argument("--window", type=int, default=WINDOW_DAYS)
     parser.add_argument("--zero-run", type=int, default=MIN_ZERO_RUN)
+    parser.add_argument("--max-unavail", type=float, default=MAX_UNAVAILABLE_SHARE)
     args = parser.parse_args()
-    main(n_items=args.items, window_days=args.window, min_zero_run=args.zero_run)
+    main(n_items=args.items, window_days=args.window, min_zero_run=args.zero_run,
+         max_unavailable_share=args.max_unavail)
